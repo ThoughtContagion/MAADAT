@@ -29,7 +29,7 @@
 param(
     [string]$TenantId,
     [string]$UserPrincipalName,
-    [string]$OutputPath = (Join-Path (Get-Location) ("SelfServiceJoinRecon_{0}.json" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))),
+    [string]$OutputPath = (Join-Path (Get-Location) ("MAADATRecon_{0}.json" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))),
     [switch]$SkipExchange,
     [switch]$IncludeBloodHoundIds,
     [Parameter(ParameterSetName = 'Prove')][string]$ProveJoin,
