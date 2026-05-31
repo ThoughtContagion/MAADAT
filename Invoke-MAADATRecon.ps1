@@ -22,8 +22,8 @@
     After a successful -ProveJoin, remove yourself from the group again.
 
 .EXAMPLE
-    .\Invoke-SelfServiceJoinRecon.ps1 -UserPrincipalName user@contoso.onmicrosoft.com
-    .\Invoke-SelfServiceJoinRecon.ps1 -ProveJoin <groupId> -RevertAfter
+    .\Invoke-MAADATRecon.ps1 -UserPrincipalName user@contoso.onmicrosoft.com
+    .\Invoke-MAADATRecon.ps1 -ProveJoin <groupId> -RevertAfter
 #>
 [CmdletBinding(DefaultParameterSetName = 'Enumerate', SupportsShouldProcess, ConfirmImpact = 'High')]
 param(
