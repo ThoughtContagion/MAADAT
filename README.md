@@ -147,17 +147,38 @@
   For continuous, tenant-wide detection, run an app-only auditor that enumerates these same
   conditions across every group rather than from a single user's vantage point.
 
-  ## Background & references
 
+  ## Background and Novel Attack Path
+
+  ### What is Known
   The dynamic-membership-rule variant is well documented; the open-distribution-list self-join
   used as a **shared-SaaS-login takeover** path is, as far as public sources go, largely
-  undocumented as a named technique. It was discovered by
-  [@redskycyber](https://github.com/redskycyber) — which is why this tool exists.
+  undocumented as a named technique. It was discovered by [@redskycyber](https://github.com/redskycyber) — which is why this tool exists.
+  
+  The individual primitives this tool covers are documented in isolation:
 
-  - [Tenable — Dynamic Group Featuring an Exploitable Rule](https://www.tenable.com/indicators/ioe/entra/DYNAMIC-GROUP-FEATURING-AN-EXPLOITABLE-RULE)
-  - [Microsoft Learn — Dynamic membership rules for groups](https://learn.microsoft.com/en-us/entra/identity/users/groups-dynamic-membership)
-  - [Microsoft Learn — Manage distribution groups in Exchange Online](https://learn.microsoft.com/en-us/exchange/recipients-in-exchange-online/manage-distribution-groups/manage-distribution-groups)
-  - [Microsoft Learn — Set up self-service group management](https://learn.microsoft.com/en-us/entra/identity/users/groups-self-service-management)
+  - **Dynamic group rule abuse** is a named, well-understood technique. Tenable ships a dedicated [Indicator of Exposure](https://www.tenable.com/indicators/ioe/entra/DYNAMIC-GROUP-FEATURING-AN-EXPLOITABLE-RULE), Microsoft Learn [explicitly warns to audit write permissions](https://learn.microsoft.com/en-us/entra/identity/users/groups-dynamic-membership) on attributes used in dynamic rules, and there are public writeups including [Abuse Dynamic Groups in Entra ID for Privilege Escalation](https://medium.com/@AlbertGlenn/abuse-dynamic-groups-in-entra-id-for-privilege-escalation-292652f8f49b) and a [2026 BloodHound Entra CTF walkthrough](https://medium.com/@cyberguy851/bloodhound-entra-id-ctf-2-from-guest-to-global-admin-exploiting-application-administrator-via-251d6d32e3ea) demonstrating guest → Global Admin via dynamic group chaining.
+
+  - **Open M365 groups and `MemberJoinRestriction`** are documented as configuration settings ([distribution group management](https://learn.microsoft.com/en-us/exchange/recipients-in-exchange-online/manage-distribution-groups/manage-distribution-groups), [MemberJoinRestriction property](https://learn.microsoft.com/en-us/previous-versions/office/exchange-server-api/ff337272(v=exchg.150))).
+
+  - **Self-join → membership → inherited access** as a general principle, and group-membership-write edges as attack path primitives, are modeled in [BloodHound / AzureHound](https://posts.specterops.io/microsoft-breach-how-can-i-see-this-in-bloodhound-33c92dca4c65). [CoreView](https://www.coreview.com/blog/elevation-of-privilege-vulnerabilities) and others discuss group-object-based elevation of privilege generally.
+
+  ### What is Novel
+
+  While researching the open DL / open M365 group self-join vector, **no existing writeup was found** that documents the abuse of `MemberJoinRestriction = Open` as a self-service entry point into a privileged group context — only the configuration setting itself is documented, not its exploitation.
+
+  More significantly, the following full attack chain was identified and executed empirically, and **does not appear to be documented anywhere as a named technique**:
+
+  > **Self-join an open distribution list that is configured as the shared login or account-recovery identity for a third-party SaaS application, trigger a password reset on the SaaS account, and intercept the reset email in the now-joined shared inbox — gaining full access to the SaaS application without touching any Entra directory role or Azure resource.**
+
+  The individual primitives (open DL, shared mailbox as SaaS identity, password reset interception) are all known. The chain — as executed — is the original finding. Existing tooling (including inspectors that look at open groups and SaaS identity separately) does not combine them into a single correlated attack path.
+
+  This tool was built in part to surface the preconditions for this chain: an open or lightly-gated mail-enabled group that holds privileged membership in an external context not visible to Entra-only tooling.
+
+    - [Tenable — Dynamic Group Featuring an Exploitable Rule](https://www.tenable.com/indicators/ioe/entra/DYNAMIC-GROUP-FEATURING-AN-EXPLOITABLE-RULE)
+    - [Microsoft Learn — Dynamic membership rules for groups](https://learn.microsoft.com/en-us/entra/identity/users/groups-dynamic-membership)
+    - [Microsoft Learn — Manage distribution groups in Exchange Online](https://learn.microsoft.com/en-us/exchange/recipients-in-exchange-online/manage-distribution-groups/manage-distribution-groups)
+    - [Microsoft Learn — Set up self-service group management](https://learn.microsoft.com/en-us/entra/identity/users/groups-self-service-management)
 
   ## Credits
 
