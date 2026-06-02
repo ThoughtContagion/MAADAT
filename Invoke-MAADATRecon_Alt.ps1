@@ -30,6 +30,10 @@
     .\Invoke-MAADATRecon_AltRecon.ps1 -UserPrincipalName user@contoso.onmicrosoft.com
     .\Invoke-MAADATRecon_AltRecon.ps1 -FirstPartyClientId 04b07795-8ddb-461a-bbee-02f9e1bf7b46 -TenantId contoso.onmicrosoft.com
     .\Invoke-MAADATRecon_AltRecon.ps1 -ProveJoin <groupId> -RevertAfter
+    .\Invoke-MAADATRecon_AltRecon.ps1 -TenantId contoso.com -AuthMethod Interactive
+    .\Invoke-MAADATRecon_AltRecon.ps1 -TenantId contoso.com -AuthMethod Interactive -ProveJoin "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" -RevertAfter
+    .\Invoke-MAADATRecon_AltRecon.ps1 -TenantId contoso.com -OutputPath "C:\Reports\contoso_recon.json"
+    .\Invoke-MAADATRecon_AltRecon.ps1 -TenantId contoso.com -OutputPath "C:\Reports\contoso_recon.json" -IncludeBloodHoundIds
 #>
 
 [CmdletBinding(DefaultParameterSetName = 'Enumerate', SupportsShouldProcess, ConfirmImpact = 'High')]
@@ -40,7 +44,11 @@ param(
     [string]$OutputPath = (Join-Path (Get-Location) ("MAADATRecon_AltRecon_{0}.json" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))),
     [switch]$SkipExchange,
     [switch]$IncludeBloodHoundIds,
-    [Parameter(ParameterSetName = 'Prove')][string]$ProveJoin,
+    [ValidateSet('DeviceCode', 'Interactive')]
+    [string]$AuthMethod = 'DeviceCode',
+    [string]$ClientSecret,
+    [string]$CertificateThumbprint,
+    [Parameter(ParameterSetName = 'Prove', Mandatory)][ValidateNotNullOrEmpty()][string]$ProveJoin,
     [Parameter(ParameterSetName = 'Prove')][switch]$RevertAfter
 )
 
@@ -59,7 +67,8 @@ function Write-Log {
     Write-Host ("[{0}] {1}" -f $Level, $Message) -ForegroundColor $color
 }
 
-function Get-GraphToken {
+# Original device code auth function, now replaced by a more flexible approach that supports multiple auth methods. Kept for reference and potential future use.
+<# function Get-GraphToken {
     param([string]$ClientId, [string]$Resource, [string]$Tenant)
     $dc = Invoke-RestMethod -Method Post `
         -Uri "https://login.microsoftonline.com/$Tenant/oauth2/devicecode?api-version=1.0" `
@@ -73,11 +82,51 @@ function Get-GraphToken {
             return Invoke-RestMethod -Method Post -ErrorAction Stop `
                 -Uri "https://login.microsoftonline.com/$Tenant/oauth2/token?api-version=1.0" `
                 -Body @{
-                    grant_type = 'device_code'
-                    code       = $dc.device_code
-                    client_id  = $ClientId
-                    resource   = $Resource
-                }
+                grant_type = 'device_code'
+                code       = $dc.device_code
+                client_id  = $ClientId
+                resource   = $Resource
+            }
+        }
+        catch {
+            $err = ($_.ErrorDetails.Message | ConvertFrom-Json).error
+            switch ($err) {
+                'authorization_pending' { continue }
+                'slow_down' { $interval += 5; continue }
+                default { throw "Device code auth failed: $err" }
+            }
+        }
+    }
+    throw 'Device code expired before authentication completed.'
+} #>
+
+function Get-GraphToken {
+    param([string]$ClientId, [string]$Resource, [string]$Tenant)
+    switch ($AuthMethod) {
+        'DeviceCode' { return Get-GraphTokenDeviceCode -ClientId $ClientId -Resource $Resource -Tenant $Tenant }
+        'Interactive' { return Get-GraphTokenInteractive -ClientId $ClientId -Resource $Resource -Tenant $Tenant }
+    }
+}
+
+function Get-GraphTokenDeviceCode {
+    param([string]$ClientId, [string]$Resource, [string]$Tenant)
+    $dc = Invoke-RestMethod -Method Post `
+        -Uri "https://login.microsoftonline.com/$Tenant/oauth2/devicecode?api-version=1.0" `
+        -Body @{ client_id = $ClientId; resource = $Resource }
+    Write-Host $dc.message -ForegroundColor Yellow
+    $interval = [int]$dc.interval
+    $deadline = (Get-Date).AddSeconds([int]$dc.expires_in)
+    while ((Get-Date) -lt $deadline) {
+        Start-Sleep -Seconds $interval
+        try {
+            return Invoke-RestMethod -Method Post -ErrorAction Stop `
+                -Uri "https://login.microsoftonline.com/$Tenant/oauth2/token?api-version=1.0" `
+                -Body @{
+                grant_type = 'device_code'
+                code       = $dc.device_code
+                client_id  = $ClientId
+                resource   = $Resource
+            }
         }
         catch {
             $err = ($_.ErrorDetails.Message | ConvertFrom-Json).error
@@ -91,15 +140,51 @@ function Get-GraphToken {
     throw 'Device code expired before authentication completed.'
 }
 
+# Use Az CLI's interactive auth flow, which supports a broader set of delegated permissions than the Microsoft Office client. This is especially useful for tenants with restrictive consent policies where device code auth may be blocked or limited.
+function Get-GraphTokenInteractive {
+    param([string]$ClientId, [string]$Resource, [string]$Tenant)
+    Add-Type -AssemblyName System.Web
+    $interactiveClientId = '04b07795-8ddb-461a-bbee-02f9e1bf7b46'
+    $redirectUri = 'http://localhost:8400'
+    $state = [System.Guid]::NewGuid().ToString()
+    $authUrl = "https://login.microsoftonline.com/$Tenant/oauth2/authorize" +
+    "?client_id=$interactiveClientId&response_type=code&redirect_uri=$([Uri]::EscapeDataString($redirectUri))" +
+    "&resource=$([Uri]::EscapeDataString($Resource))&state=$state&prompt=select_account"
+    $listener = [System.Net.HttpListener]::new()
+    $listener.Prefixes.Add("$redirectUri/")
+    $listener.Start()
+    Start-Process $authUrl
+    Write-Log "Browser opened - complete sign-in to continue." 'INFO'
+    $context = $listener.GetContext()
+    $query = [System.Web.HttpUtility]::ParseQueryString($context.Request.Url.Query)
+    $response = $context.Response
+    $response.StatusCode = 200
+    $buffer = [System.Text.Encoding]::UTF8.GetBytes('<html><body>Authentication complete. You may close this window.</body></html>')
+    $response.OutputStream.Write($buffer, 0, $buffer.Length)
+    $response.Close()
+    $listener.Stop()
+    if ($query['state'] -ne $state) { throw 'State mismatch - possible CSRF.' }
+    if ($query['error']) { throw "Interactive auth failed: $($query['error_description'])" }
+    return Invoke-RestMethod -Method Post `
+        -Uri "https://login.microsoftonline.com/$Tenant/oauth2/token" `
+        -Body @{
+        grant_type   = 'authorization_code'
+        code         = $query['code']
+        client_id    = $interactiveClientId
+        redirect_uri = $redirectUri
+        resource     = $Resource
+    }
+}
+
 function Update-GraphToken {
     $refreshed = Invoke-RestMethod -Method Post `
         -Uri "https://login.microsoftonline.com/$($Script:Auth.Tenant)/oauth2/token" `
         -Body @{
-            grant_type    = 'refresh_token'
-            refresh_token = $Script:Auth.RefreshToken
-            client_id     = $Script:Auth.ClientId
-            resource      = 'https://graph.microsoft.com'
-        }
+        grant_type    = 'refresh_token'
+        refresh_token = $Script:Auth.RefreshToken
+        client_id     = $Script:Auth.ClientId
+        resource      = 'https://graph.microsoft.com'
+    }
     $Script:Auth.AccessToken = $refreshed.access_token
     $Script:Auth.RefreshToken = $refreshed.refresh_token
 }
@@ -172,13 +257,25 @@ function Test-DynamicRuleExploitable {
     }
 }
 
-function Get-RiskTier {
+# Original risk tiering function, now replaced by a more nuanced approach that considers multiple privilege and CA factors. Kept for reference and potential future use.
+<# function Get-RiskTier {
     param([pscustomobject]$Group)
     $p = $Group.Privilege
     if ($p.HasRoleAssigned -or $p.HasEligibleRole -or $p.CAExcludeGroup) { return 'Critical' }
     if ($Group.IsRoleAssignable -or $p.CAIncludeGroup -or $p.AppRoleGrants -or
         ($Group.DynamicExploitable -and -not $Group.DynamicExploitable.GuestExcluded)) { return 'High' }
     if ($Group.MailEnabled) { return 'Medium' }   # possible shared-identity / inbox-exposure vector
+    return 'Low'
+} #>
+
+function Get-RiskTier {
+    param([pscustomobject]$Group)
+    $p = $Group.Privilege
+    if ($p.HasRoleAssigned -or $p.HasEligibleRole -or $p.CAExcludeGroup) { return 'Critical' }
+    if ($Group.IsRoleAssignable -or $p.CAIncludeGroup -or $p.AppRoleGrants -or
+        ($Group.DynamicExploitable -and -not $Group.DynamicExploitable.GuestExcluded)) { return 'High' }
+    if ($Group.MailEnabled -and $Group.JoinRestriction -ne 'ApprovalRequired') { return 'Medium' }
+    if ($Group.MailEnabled -and $Group.JoinRestriction -eq 'ApprovalRequired') { return 'Low' }
     return 'Low'
 }
 
@@ -267,74 +364,78 @@ function Get-GroupPrivilege {
 }
 
 # ---- M365 (Unified) groups: Public = self-join, no approval ----------------
-Write-Log "Enumerating groups via Graph..."
-$allGroups = Invoke-GraphGetAll -Eventual -Uri ('https://graph.microsoft.com/v1.0/groups?$count=true&$select=' +
-    'id,displayName,visibility,mail,mailEnabled,securityEnabled,isAssignableToRole,groupTypes,membershipRule,assignedLicenses')
+if ($PSCmdlet.ParameterSetName -ne 'Prove') {
+    Write-Log "Enumerating groups via Graph..."
+    $allGroups = Invoke-GraphGetAll -Eventual -Uri ('https://graph.microsoft.com/v1.0/groups?$count=true&$select=' +
+        'id,displayName,visibility,mail,mailEnabled,securityEnabled,isAssignableToRole,groupTypes,membershipRule,assignedLicenses')
 
-$results = [System.Collections.Generic.List[object]]::new()
+    $results = [System.Collections.Generic.List[object]]::new()
 
-foreach ($g in $allGroups) {
-    $isUnified = $g.groupTypes -contains 'Unified'
-    $isDynamic = $g.groupTypes -contains 'DynamicMembership'
-    $publicJoin = $isUnified -and ($g.visibility -eq 'Public')
-    $dynExploit = if ($isDynamic) { Test-DynamicRuleExploitable -Rule $g.membershipRule } else { $null }
+    foreach ($g in $allGroups) {
+        $isUnified = $g.groupTypes -contains 'Unified'
+        $isDynamic = $g.groupTypes -contains 'DynamicMembership'
+        $publicJoin = $isUnified -and ($g.visibility -eq 'Public')
+        $dynExploit = if ($isDynamic) { Test-DynamicRuleExploitable -Rule $g.membershipRule } else { $null }
 
-    # Include a group if it is self-joinable (public M365) OR a dynamic group with an exploitable rule.
-    if (-not ($publicJoin -or $dynExploit)) { continue }
+        # Include a group if it is self-joinable (public M365) OR a dynamic group with an exploitable rule.
+        if (-not ($publicJoin -or $dynExploit)) { continue }
 
-    $row = [PSCustomObject]@{
-        DisplayName        = $g.displayName
-        ObjectId           = $g.id
-        JoinVector         = if ($publicJoin) { 'Public M365 group (self-join, no approval)' } else { 'Dynamic membership (attribute-driven)' }
-        Mail               = $g.mail
-        MailEnabled        = [bool]$g.mailEnabled
-        IsRoleAssignable   = [bool]$g.isAssignableToRole
-        IsDynamic          = $isDynamic
-        DynamicExploitable = $dynExploit
-        HasLicenses        = [bool]($g.assignedLicenses.Count)
-        Privilege          = Get-GroupPrivilege -GroupId $g.id
-        RiskTier           = $null
-    }
-    $row.RiskTier = Get-RiskTier -Group $row
-    $results.Add($row)
-}
-
-# ---- Open distribution / mail-enabled security groups ----------------------
-if (-not $SkipExchange) {
-    Write-Log "Enumerating distribution groups via Exchange Online..."
-    try {
-        $openDLs = Get-DistributionGroup -ResultSize Unlimited |
-        Where-Object { $_.MemberJoinRestriction -in 'Open', 'ApprovalRequired' }
-        foreach ($dl in $openDLs) {
-            $gid = $dl.ExternalDirectoryObjectId
-            $priv = if ($gid) { Get-GroupPrivilege -GroupId $gid } else {
-                [PSCustomObject]@{ HasRoleAssigned = $false; RolesAssigned = @(); HasEligibleRole = $false; RolesEligible = @(); AppRoleGrants = @(); CAIncludeGroup = $false; CAExcludeGroup = $false; CAIncludes = @(); CAExcludes = @() }
-            }
-            $row = [PSCustomObject]@{
-                DisplayName        = $dl.DisplayName
-                ObjectId           = $gid
-                JoinVector         = "Distribution/MESG (MemberJoinRestriction = $($dl.MemberJoinRestriction))"
-                Mail               = $dl.PrimarySmtpAddress
-                MailEnabled        = $true
-                IsRoleAssignable   = $false
-                IsDynamic          = $false
-                DynamicExploitable = $null
-                HasLicenses        = $false
-                Privilege          = $priv
-                RiskTier           = $null
-            }
-            $row.RiskTier = Get-RiskTier -Group $row
-            $results.Add($row)
+        $row = [PSCustomObject]@{
+            DisplayName        = $g.displayName
+            ObjectId           = $g.id
+            JoinVector         = if ($publicJoin) { 'Public M365 group (self-join, no approval)' } else { 'Dynamic membership (attribute-driven)' }
+            Mail               = $g.mail
+            MailEnabled        = [bool]$g.mailEnabled
+            IsRoleAssignable   = [bool]$g.isAssignableToRole
+            IsDynamic          = $isDynamic
+            DynamicExploitable = $dynExploit
+            HasLicenses        = [bool]($g.assignedLicenses.Count)
+            Privilege          = Get-GroupPrivilege -GroupId $g.id
+            RiskTier           = $null
         }
+        $row.RiskTier = Get-RiskTier -Group $row
+        $results.Add($row)
     }
-    catch { Write-Log "Get-DistributionGroup failed/limited ($($_.Exception.Message)) - likely insufficient EXO RBAC for this user." 'WARN' }
-}
 
+    # ---- Open distribution / mail-enabled security groups ----------------------
+    if (-not $SkipExchange) {
+        Write-Log "Enumerating distribution groups via Exchange Online..."
+        try {
+            $openDLs = Get-DistributionGroup -ResultSize Unlimited |
+            Where-Object { $_.MemberJoinRestriction -in 'Open', 'ApprovalRequired' }
+            foreach ($dl in $openDLs) {
+                $gid = $dl.ExternalDirectoryObjectId
+                $priv = if ($gid) { Get-GroupPrivilege -GroupId $gid } else {
+                    [PSCustomObject]@{ HasRoleAssigned = $false; RolesAssigned = @(); HasEligibleRole = $false; RolesEligible = @(); AppRoleGrants = @(); CAIncludeGroup = $false; CAExcludeGroup = $false; CAIncludes = @(); CAExcludes = @() }
+                }
+                $row = [PSCustomObject]@{
+                    DisplayName        = $dl.DisplayName
+                    ObjectId           = $gid
+                    JoinVector         = "Distribution/MESG (MemberJoinRestriction = $($dl.MemberJoinRestriction))"
+                    JoinRestriction    = $dl.MemberJoinRestriction
+                    Mail               = $dl.PrimarySmtpAddress
+                    MailEnabled        = $true
+                    IsRoleAssignable   = $false
+                    IsDynamic          = $false
+                    DynamicExploitable = $null
+                    HasLicenses        = $false
+                    Privilege          = $priv
+                    RiskTier           = $null
+                }
+                $row.RiskTier = Get-RiskTier -Group $row
+                $results.Add($row)
+            }
+        }
+        catch { Write-Log "Get-DistributionGroup failed/limited ($($_.Exception.Message)) - likely insufficient EXO RBAC for this user." 'WARN' }
+    }
+}
 # ---- Report ----------------------------------------------------------------
 $tierOrder = @{ Critical = 0; High = 1; Medium = 2; Low = 3 }
 $sorted = $results | Sort-Object @{ E = { $tierOrder[$_.RiskTier] } }, DisplayName
 
-Write-Log ("Self-joinable / exploitable groups found: {0}" -f $sorted.Count) 'RESULT'
+if ($PSCmdlet.ParameterSetName -ne 'Prove') {
+    Write-Log ("Self-joinable / exploitable groups found: {0}" -f $sorted.Count) 'RESULT'
+}
 $sorted | Format-Table -AutoSize DisplayName, RiskTier, JoinVector,
 @{ N = 'Roles'; E = { ($_.Privilege.RolesAssigned + $_.Privilege.RolesEligible) -join ',' } },
 @{ N = 'CA'; E = { if ($_.Privilege.CAExcludeGroup) { 'EXCLUDE' } elseif ($_.Privilege.CAIncludeGroup) { 'include' } else { '' } } }
@@ -350,7 +451,7 @@ if ($IncludeBloodHoundIds) {
 }
 
 # ---- Optional: prove exploitability ----------------------------------------
-if ($PSCmdlet.ParameterSetName -eq 'Prove') {
+<# if ($PSCmdlet.ParameterSetName -eq 'Prove') {
     $target = $sorted | Where-Object { $_.ObjectId -eq $ProveJoin -or $_.DisplayName -eq $ProveJoin } | Select-Object -First 1
     if (-not $target) { throw "ProveJoin target '$ProveJoin' not found among enumerated self-joinable groups." }
 
@@ -360,6 +461,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Prove') {
         if ($target.JoinVector -like 'Distribution/MESG*') {
             Add-DistributionGroupMember -Identity $target.ObjectId -Member $meId -Confirm:$false
             Write-Log "Self-added to distribution group $($target.DisplayName)." 'RESULT'
+            
             if ($RevertAfter) {
                 Remove-DistributionGroupMember -Identity $target.ObjectId -Member $meId -Confirm:$false
                 Write-Log "Reverted: removed self from $($target.DisplayName)." 'RESULT'
@@ -370,6 +472,94 @@ if ($PSCmdlet.ParameterSetName -eq 'Prove') {
             $refUri = 'https://graph.microsoft.com/v1.0/groups/' + $target.ObjectId + '/members/$ref'
             Invoke-GraphRequest -Method POST -Uri $refUri -Body $body
             Write-Log "Self-added to M365 group $($target.DisplayName)." 'RESULT'
+            if ($RevertAfter) {
+                $delUri = 'https://graph.microsoft.com/v1.0/groups/' + $target.ObjectId + '/members/' + $meId + '/$ref'
+                Invoke-GraphRequest -Method DELETE -Uri $delUri
+                Write-Log "Reverted: removed self from $($target.DisplayName)." 'RESULT'
+            }
+        }
+    }
+} #>
+
+if ($PSCmdlet.ParameterSetName -eq 'Prove') {
+    if ($ProveJoin -match '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') {
+        $g = Invoke-GraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/groups/$ProveJoin`?`$select=id,displayName,groupTypes,mail,mailEnabled,isAssignableToRole,membershipRule,assignedLicenses,visibility"
+    }
+    else {
+        $g = Invoke-GraphGetAll -Uri "https://graph.microsoft.com/v1.0/groups?`$filter=displayName eq '$ProveJoin'&`$select=id,displayName,groupTypes,mail,mailEnabled,isAssignableToRole,membershipRule,assignedLicenses,visibility" -Eventual |
+        Select-Object -First 1
+        if (-not $g) { throw "No group found with displayName '$ProveJoin'." }
+    }
+    $isUnified = $g.groupTypes -contains 'Unified'
+    $isDynamic = $g.groupTypes -contains 'DynamicMembership'
+    $dynExploit = if ($isDynamic) { Test-DynamicRuleExploitable -Rule $g.membershipRule } else { $null }
+    $target = [PSCustomObject]@{
+        DisplayName        = $g.displayName
+        ObjectId           = $g.id
+        JoinVector         = if ($isUnified -and $g.visibility -eq 'Public') { 'Public M365 group (self-join, no approval)' } else { 'Dynamic membership (attribute-driven)' }
+        Mail               = $g.mail
+        MailEnabled        = [bool]$g.mailEnabled
+        IsRoleAssignable   = [bool]$g.isAssignableToRole
+        IsDynamic          = $isDynamic
+        DynamicExploitable = $dynExploit
+        HasLicenses        = [bool]($g.assignedLicenses.Count)
+        Privilege          = Get-GroupPrivilege -GroupId $g.id
+        RiskTier           = $null
+    }
+    $target.RiskTier = Get-RiskTier -Group $target
+
+    Write-Log "PROOF-OF-CONCEPT self-join target: $($target.DisplayName) [$($target.RiskTier)] via $($target.JoinVector)" 'ACTION'
+    if ($PSCmdlet.ShouldProcess($target.DisplayName, "Self-join group (MUTATING action against the tenant)")) {
+
+        if ($target.JoinVector -like 'Distribution/MESG*') {
+            Add-DistributionGroupMember -Identity $target.ObjectId -Member $meId -Confirm:$false
+            Write-Log "Self-added to distribution group $($target.DisplayName)." 'RESULT'
+
+            Write-Log "Enumerating current members of $($target.DisplayName)..." 'INFO'
+            $members = Invoke-GraphGetAll -Uri "https://graph.microsoft.com/v1.0/groups/$($target.ObjectId)/members?`$select=id,displayName,userPrincipalName,userType"
+            Write-Log "Current group members ($($members.Count)):" 'RESULT'
+            $header = "{0,-40} {1,-50} {2,-10} {3}" -f "DisplayName", "UserPrincipalName", "UserType", "ObjectId"
+            Write-Host $header -ForegroundColor White
+            Write-Host ("-" * $header.Length) -ForegroundColor White
+            foreach ($member in $members) {
+                $line = "{0,-40} {1,-50} {2,-10} {3}" -f $member.displayName, $member.userPrincipalName, $member.userType, $member.id
+                if ($member.id -eq $meId) {
+                    Write-Host $line -ForegroundColor Yellow -NoNewline
+                    Write-Host "  +New" -ForegroundColor Green
+                }
+                else {
+                    Write-Host $line
+                }
+            }
+
+            if ($RevertAfter) {
+                Remove-DistributionGroupMember -Identity $target.ObjectId -Member $meId -Confirm:$false
+                Write-Log "Reverted: removed self from $($target.DisplayName)." 'RESULT'
+            }
+        }
+        else {
+            $body = @{ '@odata.id' = "https://graph.microsoft.com/v1.0/directoryObjects/$meId" }
+            $refUri = 'https://graph.microsoft.com/v1.0/groups/' + $target.ObjectId + '/members/$ref'
+            Invoke-GraphRequest -Method POST -Uri $refUri -Body $body
+            Write-Log "Self-added to M365 group $($target.DisplayName)." 'RESULT'
+
+            Write-Log "Enumerating current members of $($target.DisplayName)..." 'INFO'
+            $members = Invoke-GraphGetAll -Uri "https://graph.microsoft.com/v1.0/groups/$($target.ObjectId)/members?`$select=id,displayName,userPrincipalName,userType"
+            Write-Log "Current group members ($($members.Count)):" 'RESULT'
+            $header = "{0,-40} {1,-50} {2,-10} {3}" -f "DisplayName", "UserPrincipalName", "UserType", "ObjectId"
+            Write-Host $header -ForegroundColor White
+            Write-Host ("-" * $header.Length) -ForegroundColor White
+            foreach ($member in $members) {
+                $line = "{0,-40} {1,-50} {2,-10} {3}" -f $member.displayName, $member.userPrincipalName, $member.userType, $member.id
+                if ($member.id -eq $meId) {
+                    Write-Host $line -ForegroundColor Yellow -NoNewline
+                    Write-Host "  +New" -ForegroundColor Green
+                }
+                else {
+                    Write-Host $line
+                }
+            }
+
             if ($RevertAfter) {
                 $delUri = 'https://graph.microsoft.com/v1.0/groups/' + $target.ObjectId + '/members/' + $meId + '/$ref'
                 Invoke-GraphRequest -Method DELETE -Uri $delUri
