@@ -106,18 +106,103 @@
   Install-Module Microsoft.Graph, ExchangeOnlineManagement -Scope CurrentUser
   ```
 
-  ## Usage
+  ## Authentication
+
+  Authentication uses the **OAuth device code or interactive browser flow** against first-party Microsoft (FOCI) clients. No app registration is required.
+
+  | Client | AppId | Notes |
+  |---|---|---|
+  | Microsoft Office (default) | `d3590ed6-52b3-4102-aeff-aad2292ab01c` | Broad delegated Graph footprint |
+  | Azure CLI | `04b07795-8ddb-461a-bbee-02f9e1bf7b46` | Used automatically for Interactive auth |
+
+  ### Auth Methods
+
+  | Method | Flag | Notes |
+  |---|---|---|
+  | Device Code | `-AuthMethod DeviceCode` | Default. Works where browser access is unavailable. |
+  | Interactive | `-AuthMethod Interactive` | Opens a browser window. Automatically uses the Azure CLI client for redirect URI compatibility. |
+
+  ---
+
+  ## Parameters
+
+  | Parameter | Type | Default | Description |
+  |---|---|---|---|
+  | `-TenantId` | String | `common` | Tenant domain or GUID. Required for Interactive auth. Strongly recommended for all runs. |
+  | `-UserPrincipalName` | String | — | UPN passed to Exchange Online `Connect-ExchangeOnline`. |
+  | `-FirstPartyClientId` | String | `d3590ed6-...` | FOCI client AppId to authenticate as for device code flow. |
+  | `-AuthMethod` | String | `DeviceCode` | Authentication method: `DeviceCode` or `Interactive`. |
+  | `-OutputPath` | String | `.\MAADATRecon_<timestamp>.json` | Path to write the JSON results file. |
+  | `-SkipExchange` | Switch | — | Skip Exchange Online connection and distribution group enumeration. |
+  | `-IncludeBloodHoundIds` | Switch | — | Write a `.bloodhound.txt` file of Critical/High group `objectId`s alongside the JSON output. |
+  | `-ProveJoin` | String | — | `objectId` or `displayName` of a single group to self-join. Enables proof-of-concept mode. |
+  | `-RevertAfter` | Switch | — | When used with `-ProveJoin`, removes the account from the group after join is confirmed. |
+
+  ---
+
+  ## Usage Examples
+
+  ### Enumeration
 
   ```powershell
-  # Read-only enumeration (safe — performs no writes), with BloodHound pivot list:
-  .\Invoke-MAADATRecon.ps1 -UserPrincipalName user@contoso.onmicrosoft.com -IncludeBloodHoundIds
+  # Basic run — device code auth, all defaults
+  .\Invoke-MAADATRecon.ps1 -TenantId contoso.com
 
-  # Target a specific tenant / skip Exchange enumeration:
-  .\Invoke-MAADATRecon.ps1 -TenantId <tenant-guid> -SkipExchange
+  # Skip Exchange Online (no EXO module / permissions)
+  .\Invoke-MAADATRecon.ps1 -TenantId contoso.com -SkipExchange
 
-  # Prove exploitability against ONE group from the report, then clean up
-  # (prompts for confirmation before the only state-changing action):
-  .\Invoke-MAADATRecon.ps1 -ProveJoin <groupId-or-name> -RevertAfter
+  # Use the Azure CLI FOCI client for a broader delegated scope
+  .\Invoke-MAADATRecon.ps1 -TenantId contoso.com -FirstPartyClientId 04b07795-8ddb-461a-bbee-02f9e1bf7b46
+
+  # Interactive browser auth
+  .\Invoke-MAADATRecon.ps1 -TenantId contoso.com -AuthMethod Interactive
+
+  # Custom output path
+  .\Invoke-MAADATRecon.ps1 -TenantId contoso.com -OutputPath "C:\Reports\contoso_recon.json"
+
+  # Include BloodHound objectId export
+  .\Invoke-MAADATRecon.ps1 -TenantId contoso.com -IncludeBloodHoundIds
+
+  # Custom output path with BloodHound export
+  .\Invoke-MAADATRecon.ps1 -TenantId contoso.com `
+      -OutputPath "C:\Reports\contoso_recon.json" -IncludeBloodHoundIds
+  ```
+
+  ### Proof of Concept (ProveJoin)
+
+  > ⚠️ **Mutating action.** `-ProveJoin` will actually add your account to the target group. Only use against tenants you are authorized to test. Every mutation is logged.
+
+  ```powershell
+  # Self-join by objectId, then revert
+  .\Invoke-MAADATRecon.ps1 -TenantId contoso.com `
+      -ProveJoin "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" -RevertAfter
+
+  # Self-join by display name, keep membership
+  .\Invoke-MAADATRecon.ps1 -TenantId contoso.com `
+      -ProveJoin "All Staff" -RevertAfter
+
+  # ProveJoin with interactive auth
+  .\Invoke-MAADATRecon.ps1 -TenantId contoso.com -AuthMethod Interactive `
+      -ProveJoin "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" -RevertAfter
+  ```
+
+  When `-ProveJoin` is used the tool will:
+  1. Look up the target group directly (no full tenant enumeration)
+  2. Display current group membership before joining
+  3. Self-join the group
+  4. Re-enumerate membership, highlighting your account in **yellow** with a **`+New`** callout in green
+  5. Optionally revert the join if `-RevertAfter` is supplied
+
+  ### Discovering Your Tenant ID
+
+  If you only know the domain, use the OpenID Connect discovery endpoint to retrieve the tenant GUID:
+
+  ```powershell
+  $disco = Invoke-RestMethod "https://login.microsoftonline.com/contoso.com/.well-known/openid-configuration"
+  ($disco.issuer -replace 'https://sts.windows.net/','').TrimEnd('/')
+  ```
+
+  ---
   ```
 
   ### Output
