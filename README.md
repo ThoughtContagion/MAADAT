@@ -259,10 +259,10 @@
 
   This tool was built in part to surface the preconditions for this chain: an open or lightly-gated mail-enabled group that holds privileged membership in an external context not visible to Entra-only tooling.
 
-    - [Tenable — Dynamic Group Featuring an Exploitable Rule](https://www.tenable.com/indicators/ioe/entra/DYNAMIC-GROUP-FEATURING-AN-EXPLOITABLE-RULE)
-    - [Microsoft Learn — Dynamic membership rules for groups](https://learn.microsoft.com/en-us/entra/identity/users/groups-dynamic-membership)
-    - [Microsoft Learn — Manage distribution groups in Exchange Online](https://learn.microsoft.com/en-us/exchange/recipients-in-exchange-online/manage-distribution-groups/manage-distribution-groups)
-    - [Microsoft Learn — Set up self-service group management](https://learn.microsoft.com/en-us/entra/identity/users/groups-self-service-management)
+  - [Tenable — Dynamic Group Featuring an Exploitable Rule](https://www.tenable.com/indicators/ioe/entra/DYNAMIC-GROUP-FEATURING-AN-EXPLOITABLE-RULE)
+  - [Microsoft Learn — Dynamic membership rules for groups](https://learn.microsoft.com/en-us/entra/identity/users/groups-dynamic-membership)
+  - [Microsoft Learn — Manage distribution groups in Exchange Online](https://learn.microsoft.com/en-us/exchange/recipients-in-exchange-online/manage-distribution-groups/manage-distribution-groups)
+  - [Microsoft Learn — Set up self-service group management](https://learn.microsoft.com/en-us/entra/identity/users/groups-self-service-management)
 
   ## Credits
 
