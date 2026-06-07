@@ -1,67 +1,111 @@
-# MAADAT Recon — Microsoft Auto Approved DL Account Takeover Recon
+# MAADAT — Microsoft Auto-Approved DL Account Takeover
 
-> Enumerate self-joinable and attribute-exploitable groups in Microsoft Entra ID (Azure AD) from a low-privileged, assumed-breach vantage point.
+![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)
+![PowerShell 7+](https://img.shields.io/badge/PowerShell-7%2B-5391FE.svg)
+![Platform: Microsoft 365](https://img.shields.io/badge/platform-Microsoft%20365-orange.svg)
+
+> An assumed-breach reconnaissance tool that finds Microsoft 365 groups and distribution
+> lists a standard user can **join without approval**, then shows which of those self-joins
+> lead to **privilege escalation, Conditional Access bypass, or account takeover**.
+
+**Attack path discovered by [@redskycyber](https://github.com/redskycyber).** Tooling by [@ThoughtContagion](https://github.com/ThoughtContagion)
+
+---
+
+## ⚠️ Authorized Use Only
+
+**MAADAT is intended solely for authorized security assessments, penetration tests, and
+educational use against tenants you own or have explicit, documented written permission to
+test.** Self-joining groups and enumerating directory objects in a Microsoft 365 tenant
+without authorization may violate the U.S. Computer Fraud and Abuse Act (CFAA), the UK
+Computer Misuse Act, and equivalent laws worldwide, as well as your agreements with
+Microsoft.
+
+By using this tool you accept full responsibility for your actions. The authors provide MAADAT "as is", without warranty of any kind, and accept **no liability**
+for misuse or for any damage arising from its use. If you do not have written authorization
+for the target tenant, **do not run this tool.**
+
+MAADAT is **read-only by default.** The only state-changing behavior — actually joining a
+group — requires the explicit `-ProveJoin` switch, prompts for confirmation, and supports
+automatic clean-up with `-RevertAfter`.
 
 ---
 
 ## Overview
 
-**MAADAT Recon** is a read-only PowerShell reconnaissance tool designed for authorized red team and assumed-breach engagements. It authenticates as a low-privileged user and enumerates:
+Microsoft 365 lets group membership be **self-service**:
 
-- **Public M365 (Unified) groups** — self-joinable without owner approval
-- **Dynamic membership groups** — whose membership rules key on user-mutable attributes (e.g. `department`, `jobTitle`, `extensionAttribute*`)
-- **Distribution / mail-enabled security groups** — with open or approval-gated join restrictions
+- **Public Microsoft 365 (Unified) groups** can be joined by any member of the organization
+  with no owner approval.
+- **Distribution lists and mail-enabled security groups** with `MemberJoinRestriction` set
+  to `Open` (or loosely-governed `ApprovalRequired`) let anyone add themselves.
+- **Dynamic-membership groups** auto-add users whose attributes match a rule — and some of
+  those attributes are user-editable.
 
-Each discovered group is correlated against:
+On their own these are convenience features. They become an attack path when a self-joinable
+group is also **privileged or trusted**: it holds a directory role, is excluded from an MFA
+Conditional Access policy, grants an application role, or — the case MAADAT is named for — is
+a **distribution list used as the shared login or password-reset identity for a third-party
+SaaS/ERP system**. An attacker who self-joins that list receives the password-reset email and
+takes over the downstream account.
 
-- Active and PIM-eligible directory role assignments
-- Conditional Access policy inclusions and exclusions
-- App role grants — including resolved role names and descriptions from the resource application manifest
-- Dynamic rule exploitability (guest exclusion awareness)
-- Group membership (optional, via `-IncludeGroupMembers`)
+MAADAT runs from the perspective of an already-compromised standard (or guest) user,
+enumerates every group that user can self-join, and **correlates each one to its privilege and
+policy linkage** so you can immediately see which self-joins actually matter.
 
-Results are risk-tiered (`Critical`, `High`, `Medium`, `Low`) and exported to JSON. Optionally, high-value group `objectId`s can be exported for use with **AzureHound / BloodHound**.
+## What MAADAT checks
 
-A `-ProveJoin` mode allows empirical proof of exploitability by actually self-adding to a target group, with optional automatic revert.
+- **Public Microsoft 365 groups** — self-join, no approval.
+- **Open / approval-required distribution lists & mail-enabled security groups** — via
+  `MemberJoinRestriction`.
+- **Exploitable dynamic-membership rules** — membership rules keyed on user-editable
+  attributes (`department`, `jobTitle`, `city`, `otherMails`, `extensionAttribute1-15`, etc.),
+  flagged higher when they lack a `user.userType -ne "Guest"` exclusion.
+- **Privilege & policy correlation** for each joinable group:
+  - Role-assignable (`isAssignableToRole`)
+  - Active **and** PIM-eligible directory role assignments — both built-in and custom, with full permission resolution
+  - Conditional Access `includeGroups` / `excludeGroups` membership (a self-joinable group in
+    an MFA policy's *exclude* list is the loudest finding)
+  - Application role grants — resolved to role name and description from the resource service principal manifest
+- **Group membership enumeration** — optionally enumerate all members of each discovered group via `-IncludeGroupMembers`
+- **Tenant self-service posture** — `allowedToCreateSecurityGroups` and the Group.Unified
+  group-creation settings.
+- **Shared-identity heuristic** — mail-enabled open-join groups flagged for manual review as
+  possible shared-login / inbox-exposure vectors.
 
----
+## Risk tiers
 
-## Background and Novel Attack Path
-
-### What is Known
-
-The individual primitives this tool covers are documented in isolation:
-
-- **Dynamic group rule abuse** is a named, well-understood technique. Tenable ships a dedicated [Indicator of Exposure](https://www.tenable.com/indicators/ioe/entra/DYNAMIC-GROUP-FEATURING-AN-EXPLOITABLE-RULE), Microsoft Learn [explicitly warns to audit write permissions](https://learn.microsoft.com/en-us/entra/identity/users/groups-dynamic-membership) on attributes used in dynamic rules, and there are public writeups including [Abuse Dynamic Groups in Entra ID for Privilege Escalation](https://medium.com/@AlbertGlenn/abuse-dynamic-groups-in-entra-id-for-privilege-escalation-292652f8f49b) and a [2026 BloodHound Entra CTF walkthrough](https://medium.com/@cyberguy851/bloodhound-entra-id-ctf-2-from-guest-to-global-admin-exploiting-application-administrator-via-251d6d32e3ea) demonstrating guest → Global Admin via dynamic group chaining.
-
-- **Open M365 groups and `MemberJoinRestriction`** are documented as configuration settings ([distribution group management](https://learn.microsoft.com/en-us/exchange/recipients-in-exchange-online/manage-distribution-groups/manage-distribution-groups), [MemberJoinRestriction property](https://learn.microsoft.com/en-us/previous-versions/office/exchange-server-api/ff337272(v=exchg.150))).
-
-- **Self-join → membership → inherited access** as a general principle, and group-membership-write edges as attack path primitives, are modeled in [BloodHound / AzureHound](https://posts.specterops.io/microsoft-breach-how-can-i-see-this-in-bloodhound-33c92dca4c65). [CoreView](https://www.coreview.com/blog/elevation-of-privilege-vulnerabilities) and others discuss group-object-based elevation of privilege generally.
-
-### What is Novel
-
-While researching the open DL / open M365 group self-join vector, **no existing writeup was found** that documents the abuse of `MemberJoinRestriction = Open` as a self-service entry point into a privileged group context — only the configuration setting itself is documented, not its exploitation.
-
-More significantly, the following full attack chain was identified and executed empirically, and **does not appear to be documented anywhere as a named technique**:
-
-> **Self-join an open distribution list that is configured as the shared login or account-recovery identity for a third-party SaaS application, trigger a password reset on the SaaS account, and intercept the reset email in the now-joined shared inbox — gaining full access to the SaaS application without touching any Entra directory role or Azure resource.**
-
-The individual primitives (open DL, shared mailbox as SaaS identity, password reset interception) are all known. The chain — as executed — is the original finding. Existing tooling (including inspectors that look at open groups and SaaS identity separately) does not combine them into a single correlated attack path.
-
-This tool was built in part to surface the preconditions for this chain: an open or lightly-gated mail-enabled group that holds privileged membership in an external context not visible to Entra-only tooling.
-
----
+| Tier | Meaning |
+|------|---------|
+| **Critical** | Self-joinable **and** holds an active/eligible directory role, or is excluded from an MFA/grant Conditional Access policy |
+| **High** | Self-joinable **and** role-assignable, has a custom role assignment, is in a CA include grant, has app-role grants, or is a dynamic group with an exploitable (non-guest-excluded) rule |
+| **Medium** | Self-joinable and mail-enabled — possible shared-identity / inbox-exposure vector (manual review) |
+| **Low** | Self-joinable with no privilege or policy linkage detected, or approval-required with no elevated privilege signals |
 
 ## Requirements
 
-| Requirement | Notes |
-|---|---|
-| PowerShell 5.1+ or PowerShell 7+ | |
-| `ExchangeOnlineManagement` module | Only required for distribution group enumeration; skippable via `-SkipExchange` |
-| Network access to `login.microsoftonline.com` and `graph.microsoft.com` | |
-| A valid user account in the target tenant | Low-privilege is sufficient for enumeration |
+- PowerShell 7+ (recommended)
+- Modules: `Microsoft.Graph` (at minimum `Microsoft.Graph.Authentication`) and
+  `ExchangeOnlineManagement`
+- A standard user account in the target tenant (the "assumed breach" identity)
 
----
+Delegated Graph scopes requested:
+
+- Enumeration: `Group.Read.All`, `Directory.Read.All`, `Policy.Read.All`,
+  `RoleManagement.Read.Directory`, `Application.Read.All`, `User.Read`
+- Proof-of-exploit (`-ProveJoin` only): `GroupMember.ReadWrite.All`
+
+> Exact consent behavior depends on the tenant. If a normal user cannot consent to or read a
+> given surface, MAADAT degrades gracefully and notes it — which is itself a useful signal
+> about the tenant's posture.
+
+## Installation
+
+```powershell
+git clone https://github.com/ThoughtContagion/MAADAT.git
+cd MAADAT
+Install-Module Microsoft.Graph, ExchangeOnlineManagement -Scope CurrentUser
+```
 
 ## Authentication
 
@@ -91,9 +135,9 @@ Authentication uses the **OAuth device code or interactive browser flow** agains
 | `-AuthMethod` | String | `DeviceCode` | Authentication method: `DeviceCode` or `Interactive`. |
 | `-OutputPath` | String | `.\MAADATRecon_<timestamp>.json` | Path to write the JSON results file. |
 | `-SkipExchange` | Switch | — | Skip Exchange Online connection and distribution group enumeration. |
-| `-IncludeGroupMembers` | Switch | — | Enumerate and include full member lists for each discovered group in the JSON output. |
+| `-IncludeGroupMembers` | Switch | — | Enumerate and include full member lists for each discovered group in the JSON output. Also surfaces `MemberCount` in the terminal table. |
 | `-IncludeBloodHoundIds` | Switch | — | Write a `.bloodhound.txt` file of Critical/High group `objectId`s alongside the JSON output. |
-| `-ProveJoin` | String | — | `objectId` or `displayName` of a single group to self-join. Enables proof-of-concept mode. Mandatory when using the `Prove` parameter set. |
+| `-ProveJoin` | String | — | `objectId` or `displayName` of a single group to self-join. Mandatory when using the `Prove` parameter set. |
 | `-RevertAfter` | Switch | — | When used with `-ProveJoin`, removes the account from the group after join is confirmed. |
 
 ---
@@ -165,59 +209,29 @@ $disco = Invoke-RestMethod "https://login.microsoftonline.com/contoso.com/.well-
 
 ---
 
-## Risk Tiers
-
-| Tier | Criteria |
-|---|---|
-| **Critical** | Group has an active directory role assignment, a PIM-eligible role, or is excluded from a Conditional Access policy |
-| **High** | Group is role-assignable, included in a Conditional Access policy, has app role grants, or is a dynamic group with an exploitable rule (guest not excluded) |
-| **Medium** | Mail-enabled group with an open or approval-gated join restriction and no privilege signals |
-| **Low** | No privilege signals identified |
-
-> **Note:** `ApprovalRequired` distribution groups are included in results for visibility — an attacker may socially engineer approval — but are rated no higher than `Medium` absent other privilege signals.
-
----
-
-## App Role Grants
-
-When a group has been granted roles against a resource application (e.g. SharePoint, a custom API, a third-party SaaS app registered in the tenant), every member of that group inherits those grants. This is particularly relevant to the novel attack chain described above — a group configured as the identity for a SaaS application will surface here.
-
-The tool resolves each grant fully against the resource application's service principal manifest, producing:
-
-| Field | Description |
-|---|---|
-| `Resource` | Display name of the application the role was granted against |
-| `ResourceId` | `objectId` of the resource service principal |
-| `AppRoleId` | GUID of the specific app role granted |
-| `RoleName` | Resolved display name of the role (e.g. `Sites.FullControl.All`) |
-| `RoleDescription` | Full description of the role as defined in the app manifest |
-
-A grant where `appRoleId` is `00000000-0000-0000-0000-000000000000` indicates default access — no specific role was assigned — and is labeled `Default Access`.
-
-App role grants on any discovered group trigger a `High` risk tier rating regardless of the specific role, since the permissions within a third-party or custom application are opaque to Entra-native tooling and may be highly privileged.
-
----
-
 ## Output
 
-### JSON Report
+- A ranked console table (Critical → Low) of self-joinable groups with join vector, member count, roles (built-in and custom), resolved app role grants, and CA linkage.
+- A full JSON report — timestamped, with the path configurable via `-OutputPath`.
+- With `-IncludeBloodHoundIds`: a companion `.bloodhound.txt` list of Critical/High group objectIds for pivoting in BloodHound / AzureHound.
 
-All results are written to a JSON file (default: `.\MAADATRecon_<yyyyMMdd_HHmmss>.json`).
+### JSON Report Structure
 
-Each entry includes:
+Each result entry in the JSON output has the following shape:
 
 ```json
 {
-  "DisplayName": "All Staff",
+  "DisplayName": "Finance Team",
   "ObjectId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
   "JoinVector": "Public M365 group (self-join, no approval)",
-  "Mail": "allstaff@contoso.com",
+  "Mail": "finance@contoso.com",
   "MailEnabled": true,
   "IsRoleAssignable": false,
   "IsDynamic": false,
   "DynamicExploitable": null,
   "HasLicenses": false,
-  "MemberCount": 42,
+  "JoinRestriction": null,
+  "MemberCount": 12,
   "Members": [
     {
       "ObjectId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
@@ -229,10 +243,21 @@ Each entry includes:
     }
   ],
   "Privilege": {
-    "HasRoleAssigned": false,
-    "RolesAssigned": [],
+    "HasRoleAssigned": true,
+    "RolesAssigned": [
+      {
+        "RoleName": "Reports Reader",
+        "IsBuiltIn": false,
+        "RolePermissions": [
+          "microsoft.office365.usageReports/allEntities/standard/read"
+        ],
+        "AssignmentId": "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx",
+        "DirectoryScopeId": "/"
+      }
+    ],
     "HasEligibleRole": false,
     "RolesEligible": [],
+    "HasCustomRole": true,
     "HasAppRoles": true,
     "AppRoleGrants": [
       {
@@ -253,30 +278,101 @@ Each entry includes:
 ```
 
 > `Members` and `MemberCount` are only populated when `-IncludeGroupMembers` is supplied. `MemberCount` will be `null` otherwise.
-
-### BloodHound Export
-
-When `-IncludeBloodHoundIds` is supplied, a second file is written alongside the JSON:
-
-```
-C:\Reports\contoso_recon.bloodhound.txt
-```
-
-This contains one `objectId` per line for all `Critical` and `High` risk groups, ready to be piped into **AzureHound** or used as input for **BloodHound** graph queries.
+>
+> `IsBuiltIn: false` on a role assignment identifies a **custom role**. Custom roles are flagged with a `[Custom]` prefix in the terminal table and independently contribute to a `High` risk tier rating via `HasCustomRole`, since their actual permissions must be reviewed manually against `RolePermissions` to assess blast radius.
+>
+> App role grants with `appRoleId` `00000000-0000-0000-0000-000000000000` indicate default access and are labeled `Default Access` in `RoleName`.
 
 ---
 
-## Scope and Limitations
+## Role Coverage
 
-- The tool operates entirely within the **delegated permissions** of the chosen FOCI client. What is readable is bounded by what Microsoft has pre-consented for that client.
-- CA policy enumeration requires the authenticated user to have sufficient delegated access; failures are caught and logged as warnings without halting execution.
-- Exchange Online enumeration requires the `ExchangeOnlineManagement` module and sufficient EXO RBAC for the acting user. Use `-SkipExchange` if unavailable.
-- Dynamic group membership rules are analyzed statically against a known list of user-mutable attributes. Rules using custom or non-standard attributes may not be flagged.
-- Distribution groups without an `ExternalDirectoryObjectId` cannot be resolved via Graph; member enumeration and privilege correlation will be skipped for those groups.
-- `-IncludeGroupMembers` will significantly increase runtime and output file size in large tenants. Use selectively where full membership context is needed.
+MAADAT resolves all three categories of role assignment against discovered groups:
+
+| Category | Coverage |
+|---|---|
+| **Entra ID built-in roles** | Fully covered — active assignments and PIM-eligible schedules, resolved by name |
+| **Custom roles** | Fully covered — resolved by name, flagged `IsBuiltIn: false`, with `RolePermissions` array from the role definition manifest; `HasCustomRole` bool on the Privilege object drives independent `High` tier rating |
+| **Application roles** | Fully covered — resolved to `RoleName` and `RoleDescription` from the resource service principal manifest; `DirectoryScopeId` included to identify tenant-wide vs scoped assignments |
+
+> **Performance note:** Role definition resolution uses a per-run cache keyed on `roleDefinitionId`, and app role resolution uses a per-group service principal cache keyed on `resourceId`. Both caches prevent redundant Graph lookups when multiple groups share the same role or resource.
 
 ---
 
-## Legal
+## Defensive Guidance
 
-This tool is intended for use by authorized security professionals during sanctioned penetration tests and red team engagements only. Unauthorized use against tenants you do not have explicit written permission to test may violate computer fraud and abuse laws in your jurisdiction. The authors accept no liability for misuse.
+Blue teams can close this exposure by:
+
+- Setting open groups to a closed join policy:
+  `Set-DistributionGroup -Identity 'Group' -MemberJoinRestriction Closed`
+- Making unintended public groups private:
+  `Set-UnifiedGroup -Identity 'Group' -AccessType Private`
+- Restricting self-service group management in Entra (disable "users can create security
+  groups"; scope Microsoft 365 group creation to an approved group).
+- Never using self-joinable groups for directory-role assignment, Conditional Access
+  inclusion/exclusion, app-role grants, or as shared login/recovery identities for external
+  services.
+- For dynamic groups, avoiding user-editable attributes in membership rules and adding a
+  `user.userType -ne "Guest"` exclusion.
+
+For continuous, tenant-wide detection, run an app-only auditor that enumerates these same
+conditions across every group rather than from a single user's vantage point.
+
+---
+
+## Background and Novel Attack Path
+
+### What is Known
+
+The dynamic-membership-rule variant is well documented; the open-distribution-list self-join
+used as a **shared-SaaS-login takeover** path is, as far as public sources go, largely
+undocumented as a named technique. It was discovered by [@redskycyber](https://github.com/redskycyber) — which is why this tool exists.
+
+The individual primitives this tool covers are documented in isolation:
+
+- **Dynamic group rule abuse** is a named, well-understood technique. Tenable ships a dedicated [Indicator of Exposure](https://www.tenable.com/indicators/ioe/entra/DYNAMIC-GROUP-FEATURING-AN-EXPLOITABLE-RULE), Microsoft Learn [explicitly warns to audit write permissions](https://learn.microsoft.com/en-us/entra/identity/users/groups-dynamic-membership) on attributes used in dynamic rules, and there are public writeups including [Abuse Dynamic Groups in Entra ID for Privilege Escalation](https://medium.com/@AlbertGlenn/abuse-dynamic-groups-in-entra-id-for-privilege-escalation-292652f8f49b) and a [2026 BloodHound Entra CTF walkthrough](https://medium.com/@cyberguy851/bloodhound-entra-id-ctf-2-from-guest-to-global-admin-exploiting-application-administrator-via-251d6d32e3ea) demonstrating guest → Global Admin via dynamic group chaining.
+
+- **Open M365 groups and `MemberJoinRestriction`** are documented as configuration settings ([distribution group management](https://learn.microsoft.com/en-us/exchange/recipients-in-exchange-online/manage-distribution-groups/manage-distribution-groups), [MemberJoinRestriction property](https://learn.microsoft.com/en-us/previous-versions/office/exchange-server-api/ff337272(v=exchg.150))).
+
+- **Self-join → membership → inherited access** as a general principle, and group-membership-write edges as attack path primitives, are modeled in [BloodHound / AzureHound](https://posts.specterops.io/microsoft-breach-how-can-i-see-this-in-bloodhound-33c92dca4c65). [CoreView](https://www.coreview.com/blog/elevation-of-privilege-vulnerabilities) and others discuss group-object-based elevation of privilege generally.
+
+### What is Novel
+
+While researching the open DL / open M365 group self-join vector, **no existing writeup was found** that documents the abuse of `MemberJoinRestriction = Open` as a self-service entry point into a privileged group context — only the configuration setting itself is documented, not its exploitation.
+
+More significantly, the following full attack chain was identified and executed empirically, and **does not appear to be documented anywhere as a named technique**:
+
+> **Self-join an open distribution list that is configured as the shared login or account-recovery identity for a third-party SaaS application, trigger a password reset on the SaaS account, and intercept the reset email in the now-joined shared inbox — gaining full access to the SaaS application without touching any Entra directory role or Azure resource.**
+
+The individual primitives (open DL, shared mailbox as SaaS identity, password reset interception) are all known. The chain — as executed — is the original finding. Existing tooling (including inspectors that look at open groups and SaaS identity separately) does not combine them into a single correlated attack path.
+
+This tool was built in part to surface the preconditions for this chain: an open or lightly-gated mail-enabled group that holds privileged membership in an external context not visible to Entra-only tooling. App role grants on discovered groups — now fully resolved to role name and description — are the primary signal for this condition.
+
+### References
+
+- [Tenable — Dynamic Group Featuring an Exploitable Rule](https://www.tenable.com/indicators/ioe/entra/DYNAMIC-GROUP-FEATURING-AN-EXPLOITABLE-RULE)
+- [Microsoft Learn — Dynamic membership rules for groups](https://learn.microsoft.com/en-us/entra/identity/users/groups-dynamic-membership)
+- [Microsoft Learn — Manage distribution groups in Exchange Online](https://learn.microsoft.com/en-us/exchange/recipients-in-exchange-online/manage-distribution-groups/manage-distribution-groups)
+- [Microsoft Learn — Set up self-service group management](https://learn.microsoft.com/en-us/entra/identity/users/groups-self-service-management)
+
+---
+
+## Credits
+
+- **Attack-path research & discovery:** [@redskycyber](https://github.com/redskycyber) —
+  identified the self-service-join → shared-distribution-list → account-takeover path that
+  MAADAT operationalizes.
+- **Tooling & engineering:** [@ThoughtContagion](https://github.com/ThoughtContagion)
+
+## License
+
+Licensed under the **GNU Affero General Public License v3.0 (AGPLv3)**. See [LICENSE](LICENSE).
+The AGPLv3 license governs copying, modification, and distribution; it does **not** grant any
+permission to test systems you are not authorized to assess — see *Authorized Use Only* above.
+
+## Disclaimer
+
+This project is not affiliated with or endorsed by Microsoft. "Microsoft 365", "Entra", and
+related marks belong to Microsoft. Use only with explicit authorization.
+
+---
