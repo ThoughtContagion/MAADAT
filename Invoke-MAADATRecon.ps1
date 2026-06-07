@@ -273,7 +273,7 @@ function Get-RiskTier {
     param([pscustomobject]$Group)
     $p = $Group.Privilege
     if ($p.HasRoleAssigned -or $p.HasEligibleRole -or $p.CAExcludeGroup) { return 'Critical' }
-    if ($Group.IsRoleAssignable -or $p.CAIncludeGroup -or $p.HasAppRoles -or
+    if ($Group.IsRoleAssignable -or $p.CAIncludeGroup -or $p.HasAppRoles -or $p.HasCustomRole -or
         ($Group.DynamicExploitable -and -not $Group.DynamicExploitable.GuestExcluded)) { return 'High' }
     if ($Group.MailEnabled -and $Group.JoinRestriction -ne 'ApprovalRequired') { return 'Medium' }
     if ($Group.MailEnabled -and $Group.JoinRestriction -eq 'ApprovalRequired') { return 'Low' }
@@ -357,16 +357,60 @@ function Get-CALinkage {
 function Get-GroupPrivilege {
     param([string]$GroupId)
     $roleAssigned = @(); $roleEligible = @(); $appRoles = @()
-    try {
-        $ra = Invoke-GraphGetAll -Uri ("https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?`$filter=principalId eq '$GroupId'&`$expand=roleDefinition")
-        $roleAssigned = @($ra | ForEach-Object { $_.roleDefinition.displayName })
+
+    $rdCache = @{}
+
+    function Resolve-RoleDefinition {
+        param([string]$RoleDefinitionId)
+        
+        if ($rdCache.ContainsKey($RoleDefinitionId)) { return $rdCache[$RoleDefinitionId] }
+        
+        try {
+            $rd = Invoke-GraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions/$RoleDefinitionId`?`$select=displayName,isBuiltIn,rolePermissions"
+            $resolved = [PSCustomObject]@{
+                RoleName        = $rd.displayName
+                IsBuiltIn       = [bool]$rd.isBuiltIn
+                RolePermissions = @($rd.rolePermissions | ForEach-Object { $_.allowedResourceActions } | ForEach-Object { $_ })
+            }
+            $rdCache[$RoleDefinitionId] = $resolved
+            return $resolved
+        }
+        catch {
+            $rdCache[$RoleDefinitionId] = $null
+            return $null
+        }
     }
-    catch {}
+
     try {
-        $re = Invoke-GraphGetAll -Uri ("https://graph.microsoft.com/v1.0/roleManagement/directory/roleEligibilitySchedules?`$filter=principalId eq '$GroupId'&`$expand=roleDefinition")
-        $roleEligible = @($re | ForEach-Object { $_.roleDefinition.displayName })
+        $ra = Invoke-GraphGetAll -Uri "https://graph.microsoft.com/v1.0/roleManagement/directory/roleAssignments?`$filter=principalId eq '$GroupId'&`$expand=roleDefinition"
+        $roleAssigned = @($ra | ForEach-Object {
+                $rd = Resolve-RoleDefinition -RoleDefinitionId $_.roleDefinition.id
+                [PSCustomObject]@{
+                    RoleName         = $_.roleDefinition.displayName
+                    IsBuiltIn        = if ($rd) { $rd.IsBuiltIn } else { $null }
+                    RolePermissions  = if ($rd) { $rd.RolePermissions } else { @() }
+                    AssignmentId     = $_.id
+                    DirectoryScopeId = $_.directoryScopeId
+                }
+            })
     }
-    catch {}
+    catch { $roleAssigned = @() }
+
+    try {
+        $re = Invoke-GraphGetAll -Uri "https://graph.microsoft.com/v1.0/roleManagement/directory/roleEligibilitySchedules?`$filter=principalId eq '$GroupId'&`$expand=roleDefinition"
+        $roleEligible = @($re | ForEach-Object {
+                $rd = Resolve-RoleDefinition -RoleDefinitionId $_.roleDefinition.id
+                [PSCustomObject]@{
+                    RoleName         = $_.roleDefinition.displayName
+                    IsBuiltIn        = if ($rd) { $rd.IsBuiltIn } else { $null }
+                    RolePermissions  = if ($rd) { $rd.RolePermissions } else { @() }
+                    EligibilityId    = $_.id
+                    DirectoryScopeId = $_.directoryScopeId
+                }
+            })
+    }
+    catch { $roleEligible = @() }
+
     try {
         try {
             $ar = Invoke-GraphGetAll -Uri "https://graph.microsoft.com/v1.0/groups/$GroupId/appRoleAssignments"
@@ -403,14 +447,16 @@ function Get-GroupPrivilege {
         catch { $appRoles = @() }
     }
     catch {}
+
     $ca = Get-CALinkage -GroupId $GroupId
     [PSCustomObject]@{
         HasRoleAssigned = [bool]$roleAssigned.Count
         RolesAssigned   = $roleAssigned
         HasEligibleRole = [bool]$roleEligible.Count
         RolesEligible   = $roleEligible
-        AppRoleGrants   = $appRoles
+        HasCustomRole   = [bool](($roleAssigned + $roleEligible) | Where-Object { $_.IsBuiltIn -eq $false })
         HasAppRoles     = [bool]$appRoles.Count
+        AppRoleGrants   = $appRoles
         CAIncludeGroup  = [bool]$ca.Include.Count
         CAExcludeGroup  = [bool]$ca.Exclude.Count
         CAIncludes      = $ca.Include
@@ -498,7 +544,11 @@ if ($PSCmdlet.ParameterSetName -ne 'Prove') {
 
 $sorted | Format-Table -AutoSize DisplayName, RiskTier, JoinVector,
 @{ N = 'Members'; E = { if ($null -ne $_.MemberCount) { $_.MemberCount } else { '-' } } },
-@{ N = 'Roles'; E = { ($_.Privilege.RolesAssigned + $_.Privilege.RolesEligible) -join ',' } },
+@{ N = 'Roles'; E = {
+        ($_.Privilege.RolesAssigned + $_.Privilege.RolesEligible |
+        ForEach-Object { if (-not $_.IsBuiltIn) { "[Custom] $($_.RoleName)" } else { $_.RoleName } }) -join ','
+    }
+},
 @{ N = 'AppRoles'; E = { ($_.Privilege.AppRoleGrants | ForEach-Object { "$($_.Resource)\$($_.RoleName)" }) -join ',' } },
 @{ N = 'CA'; E = { if ($_.Privilege.CAExcludeGroup) { 'EXCLUDE' } elseif ($_.Privilege.CAIncludeGroup) { 'include' } else { '' } } }
 
