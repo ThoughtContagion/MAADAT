@@ -104,7 +104,7 @@ function Write-Log {
 function Get-GraphToken {
     param([string]$ClientId, [string]$Resource, [string]$Tenant)
     switch ($AuthMethod) {
-        'DeviceCode' { return Get-GraphTokenDeviceCode -ClientId $ClientId -Resource $Resource -Tenant $Tenant }
+        'DeviceCode' { return Get-GraphTokenDeviceCode  -ClientId $ClientId -Resource $Resource -Tenant $Tenant }
         'Interactive' { return Get-GraphTokenInteractive -ClientId $ClientId -Resource $Resource -Tenant $Tenant }
     }
 }
@@ -161,7 +161,10 @@ function Get-GraphTokenInteractive {
     $response = $context.Response
     $response.StatusCode = 200
     $buffer = [System.Text.Encoding]::UTF8.GetBytes('<html><body>Authentication complete. You may close this window.</body></html>')
+    $response.ContentLength64 = $buffer.Length
     $response.OutputStream.Write($buffer, 0, $buffer.Length)
+    $response.OutputStream.Flush()
+    $response.OutputStream.Close()
     $response.Close()
     $listener.Stop()
     if ($query['state'] -ne $state) { throw 'State mismatch - possible CSRF.' }
@@ -258,17 +261,6 @@ function Test-DynamicRuleExploitable {
     }
 }
 
-# Original risk tiering function, now replaced by a more nuanced approach that considers multiple privilege and CA factors. Kept for reference and potential future use.
-<# function Get-RiskTier {
-    param([pscustomobject]$Group)
-    $p = $Group.Privilege
-    if ($p.HasRoleAssigned -or $p.HasEligibleRole -or $p.CAExcludeGroup) { return 'Critical' }
-    if ($Group.IsRoleAssignable -or $p.CAIncludeGroup -or $p.AppRoleGrants -or
-        ($Group.DynamicExploitable -and -not $Group.DynamicExploitable.GuestExcluded)) { return 'High' }
-    if ($Group.MailEnabled) { return 'Medium' }   # possible shared-identity / inbox-exposure vector
-    return 'Low'
-} #>
-
 function Get-RiskTier {
     param([pscustomobject]$Group)
     $p = $Group.Privilege
@@ -362,9 +354,7 @@ function Get-GroupPrivilege {
 
     function Resolve-RoleDefinition {
         param([string]$RoleDefinitionId)
-        
         if ($rdCache.ContainsKey($RoleDefinitionId)) { return $rdCache[$RoleDefinitionId] }
-        
         try {
             $rd = Invoke-GraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/roleManagement/directory/roleDefinitions/$RoleDefinitionId`?`$select=displayName,isBuiltIn,rolePermissions"
             $resolved = [PSCustomObject]@{
@@ -412,41 +402,36 @@ function Get-GroupPrivilege {
     catch { $roleEligible = @() }
 
     try {
-        try {
-            $ar = Invoke-GraphGetAll -Uri "https://graph.microsoft.com/v1.0/groups/$GroupId/appRoleAssignments"
-            $spCache = @{}
-            $appRoles = @($ar | ForEach-Object {
-                    $grant = $_
-                    $spId = $grant.resourceId
-                    if (-not $spCache.ContainsKey($spId)) {
-                        try {
-                            $sp = Invoke-GraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$spId`?`$select=displayName,appRoles"
-                            $spCache[$spId] = $sp
-                        }
-                        catch {
-                            $spCache[$spId] = $null
-                        }
+        $ar = Invoke-GraphGetAll -Uri "https://graph.microsoft.com/v1.0/groups/$GroupId/appRoleAssignments"
+        $spCache = @{}
+        $appRoles = @($ar | ForEach-Object {
+                $grant = $_
+                $spId = $grant.resourceId
+                if (-not $spCache.ContainsKey($spId)) {
+                    try {
+                        $sp = Invoke-GraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/servicePrincipals/$spId`?`$select=displayName,appRoles"
+                        $spCache[$spId] = $sp
                     }
-                    $sp = $spCache[$spId]
-                    $roleName = $null
-                    $roleDescription = $null
-                    if ($sp -and $grant.appRoleId -ne '00000000-0000-0000-0000-000000000000') {
-                        $resolved = $sp.appRoles | Where-Object { $_.id -eq $grant.appRoleId } | Select-Object -First 1
-                        $roleName = $resolved.displayName
-                        $roleDescription = $resolved.description
-                    }
-                    [PSCustomObject]@{
-                        Resource        = $grant.resourceDisplayName
-                        ResourceId      = $spId
-                        AppRoleId       = $grant.appRoleId
-                        RoleName        = if ($roleName) { $roleName } else { 'Default Access' }
-                        RoleDescription = $roleDescription
-                    }
-                })
-        }
-        catch { $appRoles = @() }
+                    catch { $spCache[$spId] = $null }
+                }
+                $sp = $spCache[$spId]
+                $roleName = $null
+                $roleDescription = $null
+                if ($sp -and $grant.appRoleId -ne '00000000-0000-0000-0000-000000000000') {
+                    $resolved = $sp.appRoles | Where-Object { $_.id -eq $grant.appRoleId } | Select-Object -First 1
+                    $roleName = $resolved.displayName
+                    $roleDescription = $resolved.description
+                }
+                [PSCustomObject]@{
+                    Resource        = $grant.resourceDisplayName
+                    ResourceId      = $spId
+                    AppRoleId       = $grant.appRoleId
+                    RoleName        = if ($roleName) { $roleName } else { 'Default Access' }
+                    RoleDescription = $roleDescription
+                }
+            })
     }
-    catch {}
+    catch { $appRoles = @() }
 
     $ca = Get-CALinkage -GroupId $GroupId
     [PSCustomObject]@{
@@ -498,6 +483,7 @@ if ($PSCmdlet.ParameterSetName -ne 'Prove') {
         }
         $row.MemberCount = if ($row.Members) { $row.Members.Count } else { $null }
         $row.RiskTier = Get-RiskTier -Group $row
+        $results.Add($row)
     }
 
     # ---- Open distribution / mail-enabled security groups ----------------------
@@ -509,9 +495,15 @@ if ($PSCmdlet.ParameterSetName -ne 'Prove') {
             foreach ($dl in $openDLs) {
                 $gid = $dl.ExternalDirectoryObjectId
                 $priv = if ($gid) { Get-GroupPrivilege -GroupId $gid } else {
-                    [PSCustomObject]@{ HasRoleAssigned = $false; RolesAssigned = @(); HasEligibleRole = $false; RolesEligible = @(); AppRoleGrants = @(); CAIncludeGroup = $false; CAExcludeGroup = $false; CAIncludes = @(); CAExcludes = @() }
+                    [PSCustomObject]@{
+                        HasRoleAssigned = $false; RolesAssigned = @()
+                        HasEligibleRole = $false; RolesEligible = @()
+                        HasCustomRole = $false; HasAppRoles = $false
+                        AppRoleGrants = @()
+                        CAIncludeGroup = $false; CAExcludeGroup = $false
+                        CAIncludes = @(); CAExcludes = @()
+                    }
                 }
-                
                 $row = [PSCustomObject]@{
                     DisplayName        = $dl.DisplayName
                     ObjectId           = $gid
@@ -522,6 +514,7 @@ if ($PSCmdlet.ParameterSetName -ne 'Prove') {
                     IsDynamic          = $false
                     DynamicExploitable = $null
                     HasLicenses        = $false
+                    JoinRestriction    = $dl.MemberJoinRestriction
                     Privilege          = $priv
                     Members            = if ($IncludeGroupMembers) { Get-GroupMembers -GroupId $gid } else { $null }
                     MemberCount        = $null
@@ -529,12 +522,15 @@ if ($PSCmdlet.ParameterSetName -ne 'Prove') {
                 }
                 $row.MemberCount = if ($row.Members) { $row.Members.Count } else { $null }
                 $row.RiskTier = Get-RiskTier -Group $row
+                $results.Add($row)
             }
         }
         catch { Write-Log "Get-DistributionGroup failed/limited ($($_.Exception.Message)) - likely insufficient EXO RBAC for this user." 'WARN' }
     }
 }
+
 # ---- Report ----------------------------------------------------------------
+if (-not $results) { $results = [System.Collections.Generic.List[object]]::new() }
 $tierOrder = @{ Critical = 0; High = 1; Medium = 2; Low = 3 }
 $sorted = $results | Sort-Object @{ E = { $tierOrder[$_.RiskTier] } }, DisplayName
 
@@ -563,36 +559,6 @@ if ($IncludeBloodHoundIds) {
 }
 
 # ---- Optional: prove exploitability ----------------------------------------
-<# if ($PSCmdlet.ParameterSetName -eq 'Prove') {
-    $target = $sorted | Where-Object { $_.ObjectId -eq $ProveJoin -or $_.DisplayName -eq $ProveJoin } | Select-Object -First 1
-    if (-not $target) { throw "ProveJoin target '$ProveJoin' not found among enumerated self-joinable groups." }
-
-    Write-Log "PROOF-OF-CONCEPT self-join target: $($target.DisplayName) [$($target.RiskTier)] via $($target.JoinVector)" 'ACTION'
-    if ($PSCmdlet.ShouldProcess($target.DisplayName, "Self-join group (MUTATING action against the tenant)")) {
-
-        if ($target.JoinVector -like 'Distribution/MESG*') {
-            Add-DistributionGroupMember -Identity $target.ObjectId -Member $meId -Confirm:$false
-            Write-Log "Self-added to distribution group $($target.DisplayName)." 'RESULT'
-            
-            if ($RevertAfter) {
-                Remove-DistributionGroupMember -Identity $target.ObjectId -Member $meId -Confirm:$false
-                Write-Log "Reverted: removed self from $($target.DisplayName)." 'RESULT'
-            }
-        }
-        else {
-            $body = @{ '@odata.id' = "https://graph.microsoft.com/v1.0/directoryObjects/$meId" }
-            $refUri = 'https://graph.microsoft.com/v1.0/groups/' + $target.ObjectId + '/members/$ref'
-            Invoke-GraphRequest -Method POST -Uri $refUri -Body $body
-            Write-Log "Self-added to M365 group $($target.DisplayName)." 'RESULT'
-            if ($RevertAfter) {
-                $delUri = 'https://graph.microsoft.com/v1.0/groups/' + $target.ObjectId + '/members/' + $meId + '/$ref'
-                Invoke-GraphRequest -Method DELETE -Uri $delUri
-                Write-Log "Reverted: removed self from $($target.DisplayName)." 'RESULT'
-            }
-        }
-    }
-} #>
-
 if ($PSCmdlet.ParameterSetName -eq 'Prove') {
     if ($ProveJoin -match '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$') {
         $g = Invoke-GraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/groups/$ProveJoin`?`$select=id,displayName,groupTypes,mail,mailEnabled,isAssignableToRole,membershipRule,assignedLicenses,visibility"
@@ -680,3 +646,7 @@ if ($PSCmdlet.ParameterSetName -eq 'Prove') {
         }
     }
 }
+
+# ---- Disconnect Sessions ----------------------------------------
+Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
+Disconnect-MgGraph -Confirm:$false -ErrorAction SilentlyContinue
