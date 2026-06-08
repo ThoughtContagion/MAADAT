@@ -649,4 +649,4 @@ if ($PSCmdlet.ParameterSetName -eq 'Prove') {
 
 # ---- Disconnect Sessions ----------------------------------------
 Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue
-Disconnect-MgGraph -Confirm:$false -ErrorAction SilentlyContinue
+Disconnect-MgGraph
