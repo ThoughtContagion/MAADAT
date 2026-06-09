@@ -38,7 +38,7 @@
 
 [CmdletBinding(DefaultParameterSetName = 'Enumerate', SupportsShouldProcess, ConfirmImpact = 'High')]
 param(
-    [string]$TenantId,
+    [[Parameter(Mandatory)][string]$TenantId,
     [string]$UserPrincipalName,
     [string]$FirstPartyClientId = 'd3590ed6-52b3-4102-aeff-aad2292ab01c',
     [string]$OutputPath = (Join-Path (Get-Location) ("MAADATRecon_AltRecon_{0}.json" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))),
